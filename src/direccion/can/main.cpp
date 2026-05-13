@@ -1,12 +1,11 @@
 /**
  * ================================================================
- * CONTROL DE DIRECCIÓN v2.1
+ * CONTROL DE DIRECCIÓN v2.2
  * Feather RP2040 CAN + Puente H BTS7960
  * ================================================================
  *
- * FIX v2.1:
- *   - Telemetría movida de 0x201 → 0x101
- *     (antes chocaba con feedback de frenos y saturaba el bus)
+ * FIX v2.2:
+ *   - Ajueste de Min y Max
  *
  * PINOUT BTS7960 → Feather:
  *   R_EN + L_EN (juntos) → PIN 5  Feather  (enable puente)
@@ -76,7 +75,7 @@ byte posicionObjetivo;
 const int TOLERANCIA = 1;
 
 // ================================================================
-//  FILTRO PROMEDIO MÓVIL (igual al de Yona)
+//  FILTRO PROMEDIO MÓVIL 
 // ================================================================
 const int N = 6;
 int  bufferLecturas[N];
