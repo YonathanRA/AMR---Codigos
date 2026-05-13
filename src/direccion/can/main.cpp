@@ -66,8 +66,8 @@ bool displayOK = false;
 //  Escalado x4 para 12 bits:   RAW_MIN=1728, RAW_MAX=3388
 //  AJUSTA con los valores reales que veas en el monitor Serial.
 // ================================================================
-const int RAW_MIN = 1728;
-const int RAW_MAX = 3388;
+const int RAW_MIN = 1200;   // IZQUIERDA (~1198-1201)
+const int RAW_MAX = 2740;   // DERECHA   (~2738-2743)
 
 // ================================================================
 //  CONTROL
