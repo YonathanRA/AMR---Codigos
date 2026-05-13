@@ -38,8 +38,8 @@ bool canOK = false;
 #define MOTOR_PWM      A1
 #define RELAY_ENABLE   4
 #define MOTOR_DIR_REV  11
-#define CONFIG_L1      12   // ✅ restaurado — activa transistor L1 constantemente
-#define CONFIG_L2      13   // ✅ restaurado — transistor L2 siempre apagado
+#define CONFIG_L1      12   //  restaurado — activa transistor L1 constantemente
+#define CONFIG_L2      13   //  restaurado — transistor L2 siempre apagado
 
 // --- VARIABLES DE ESTADO ---
 int  velocidadObj    = 0;
@@ -127,14 +127,16 @@ void setup() {
   pinMode(MOTOR_PWM, OUTPUT);
   pinMode(RELAY_ENABLE, OUTPUT);
   pinMode(MOTOR_DIR_REV, OUTPUT);
-  pinMode(CONFIG_L1, OUTPUT);   // ✅ restaurado
-  pinMode(CONFIG_L2, OUTPUT);   // ✅ restaurado
+  pinMode(CONFIG_L1, OUTPUT);   //  restaurado
+  pinMode(CONFIG_L2, OUTPUT);   //  restaurado
 
-  digitalWrite(CONFIG_L1, HIGH);  // ✅ 3.3V → transistor ON → 5V a L1 siempre
-  digitalWrite(CONFIG_L2, LOW);   // ✅ 0V   → transistor OFF → 0V en L2 siempre
+  digitalWrite(CONFIG_L1, HIGH);  //  3.3V → transistor ON → 5V a L1 siempre
+  digitalWrite(CONFIG_L2, LOW);   //  0V   → transistor OFF → 0V en L2 siempre
   digitalWrite(RELAY_ENABLE, LOW);
-  digitalWrite(MOTOR_DIR_REV, LOW);
+  digitalWrite(MOTOR_DIR_REV, HIGH);  // FIX: HIGH=FWD, alineado con direccion=true
   analogWrite(MOTOR_PWM, 0);
+  analogWriteFreq(10000);             // FIX: frecuencia PWM explícita
+  analogWriteRange(255);
 
   // --- OLED INIT ---
   Wire.begin();
@@ -197,11 +199,23 @@ void loop() {
         }
         else if (id == ID_CMD_RELE && mcp.available()) {
           relayState = (mcp.read() > 0);
+          if (!relayState) {             // FIX: apagar motor antes de abrir relé
+            velocidadObj    = 0;
+            velocidadActual = 0;
+            analogWrite(MOTOR_PWM, 0);
+          }
           digitalWrite(RELAY_ENABLE, relayState ? HIGH : LOW);
           enviarMensajeCAN(ID_FB_RELE, relayState);
         }
         else if (id == ID_CMD_DIR && mcp.available()) {
-          direccion = (mcp.read() > 0);
+          bool nuevaDir = (mcp.read() > 0);
+          if (nuevaDir != direccion) {   // FIX: parar antes de cambiar dirección
+            velocidadObj    = 0;
+            velocidadActual = 0;
+            analogWrite(MOTOR_PWM, 0);
+            delay(150);
+            direccion = nuevaDir;
+          }
           digitalWrite(MOTOR_DIR_REV, direccion ? HIGH : LOW);
           enviarMensajeCAN(ID_FB_DIR, direccion);
         }
