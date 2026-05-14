@@ -9,8 +9,11 @@
 |----------|---------------|----------|
 | **VS Code** | El editor de código (reemplaza al Arduino IDE) | code.visualstudio.com |
 | **PlatformIO** | Extensión de VS Code que compila y sube el código al microcontrolador | Se instala desde dentro de VS Code |
+| **Git** | **Obligatorio** — PlatformIO lo usa para descargar la plataforma del Feather RP2040 desde GitHub. Sin Git, el proyecto no compila aunque tengas el código. | git-scm.com |
 
 > **Python** también es necesario. PlatformIO te avisa si no lo tienes y te da el link.
+
+> **¿Por qué Git aunque no uses GitHub?** Este proyecto usa `platform = https://github.com/maxgerhardt/platform-raspberrypi.git` en `platformio.ini`. Cuando PlatformIO compila por primera vez, descarga esa plataforma usando Git. Si Git no está instalado, la compilación falla con un error de "platform not found" o similar.
 
 ### Instalar PlatformIO en VS Code
 
@@ -28,7 +31,7 @@ Hay dos formas de bajar el proyecto. **Elegí una sola.**
 
 ---
 
-### Opción A — Descargar como ZIP *(más fácil, sin instalar nada extra)*
+### Opción A — Descargar como ZIP 
 
 1. Ir al repositorio en GitHub (pedile el link a quien te sumó al proyecto)
 2. Click en el botón verde **`< > Code`**
@@ -43,7 +46,7 @@ Hay dos formas de bajar el proyecto. **Elegí una sola.**
 
 ---
 
-### Opción B — Clonar con Git *(recomendado si vas a contribuir o queres tener siempre la última versión)*
+### Opción B — Clonar con Git *(recomendado)*
 
 #### Instalar Git
 
@@ -169,7 +172,7 @@ Cuando vayas a subir código al microcontrolador, primero tenés que **seleccion
 En la parte de abajo de VS Code vas a ver algo así:
 
 ```
-🔌  tren_motriz_can  ✓  →  🔌
+   tren_motriz_can  ✓  →  🔌
 ```
 
 Click en el nombre del entorno (ej. `tren_motriz_can`) para cambiar cuál está activo. Aparece una lista con los 8 entornos:
@@ -187,7 +190,7 @@ interprete_serial
 
 Seleccioná el que corresponde al microcontrolador que tenés conectado, y recién ahí apretá el botón de subir `→`.
 
-### Desde el panel de PlatformIO (alienígena 👾)
+### Desde el panel de PlatformIO 
 
 ```
 PROJECT TASKS
@@ -226,7 +229,49 @@ La velocidad ya está configurada en **115200 baud** — no hace falta cambiar n
 
 ---
 
-## 8. Errores comunes al venir de Arduino
+## 8. Driver USB para subir código (Windows) — Zadig
+
+El Feather RP2040 usa **picotool** para cargar el firmware. En Windows, la primera vez
+que conectás la placa en modo bootloader, el sistema no tiene el driver correcto y
+la carga falla. Hay que instalarlo una sola vez con **Zadig**.
+
+> Este paso es **obligatorio en Windows** la primera vez que usás una placa nueva.
+> Solo se hace una vez por computadora.
+
+### Paso a paso
+
+1. Descargar **Zadig** desde `zadig.akeo.ie` y abrirlo (no requiere instalación).
+
+2. Poner la placa en **modo bootloader**: hacer doble tap rápido en el botón RESET.
+   - La placa aparece como unidad USB llamada **`RPI-RP2`** en el Explorador de archivos.
+   - Si no aparece, intentar de nuevo — el doble tap tiene que ser rápido.
+
+3. En Zadig: **Options → List All Devices**
+
+4. En el menú desplegable buscar **`RP2 Boot (Interface 1)`**
+   - USB ID: `2E8A 0003`
+   - El driver actual dice `(NONE)`
+
+5. Asegurarse de que el driver de destino (flecha verde →) sea **`WinUSB`**
+
+6. Click en **Install Driver** y esperar a que termine.
+
+7. Listo. Hacer doble tap RESET de nuevo y subir el código desde PlatformIO.
+
+> **No tocar** `Pico Serial (Interface 0)` — ese es el puerto serial normal usado por
+> el Monitor Serial. Reemplazarlo con WinUSB rompe la comunicación serial.
+
+### Cómo subir el código después de instalar el driver
+
+Cada vez que quieras subir código:
+
+1. Doble tap RESET → aparece la unidad `RPI-RP2`
+2. En PlatformIO: seleccionar el entorno correcto y click en `→` (Upload)
+3. picotool detecta la placa automáticamente y carga el firmware
+
+---
+
+## 9. Errores comunes al venir de Arduino
 
 | Error | Qué significa | Solución |
 |-------|--------------|----------|
