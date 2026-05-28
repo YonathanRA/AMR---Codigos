@@ -1,16 +1,23 @@
 /*
  * ================================================================
- *   FEATHER RP2040 CAN — SUBSISTEMA FRENOS  v2.5
+ *   FEATHER RP2040 CAN — SUBSISTEMA TREN MOTRIZ  v2.5
  *
- *   Mejoras v2.5:
- *   - WATCHDOG: si master no manda en 1500ms → aplicar freno
- *   - Timeout más largo para evitar freno fantasma por glitches
- *   - Rearme: cuando llega comando 0x200 o 0x210 del master
+ *   Versión final con:
+ *   - WATCHDOG 500ms con modo seguro automático
+ *   - masterOffline + OLED dedicado
+ *   - Drenado completo de cola CAN (while + continue)
+ *   - Pre-stop motor antes de cambiar dirección (delay 150ms)
+ *   - Pre-stop PWM antes de abrir relé (evita arco)
+ *   - MOTOR_DIR_REV INVERTIDO: LOW=FWD, HIGH=REV
+ *     (corrige cableado físico del driver)
+ *   - Marchas L1=HIGH, L2=LOW hardcoded
  *
- *   Funcionalidad heredada:
- *   - Detección paro físico vía ACT_FLT
- *   - Modo recuperación
- *   - Error de pot persistente
+ *   CAN:
+ *     RX 0x300 → velocidad (0-100%)
+ *     RX 0x310 → relay enable
+ *     RX 0x320 → reversa
+ *     RX 0x210 → emergencia
+ *     TX 0x301/311/321 → feedback
  * ================================================================
  */
 
@@ -20,6 +27,7 @@
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_MCP2515.h>
 
+// --- OLED ---
 #define SCREEN_WIDTH   128
 #define SCREEN_HEIGHT   64
 #define OLED_RESET      -1
@@ -27,207 +35,95 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool displayOK = false;
 
+// --- CAN BUS ---
 #define CAN_BAUDRATE    250000
 Adafruit_MCP2515 mcp(PIN_CAN_CS);
 bool canOK = false;
 
-#define ID_CMD_FRENO    0x200
-#define ID_FB_FRENO     0x201
-#define ID_EMERGENCIA   0x210
+#define ID_CMD_PWM         0x300
+#define ID_CMD_RELE        0x310
+#define ID_CMD_DIR         0x320
+#define ID_FB_PWM          0x301
+#define ID_FB_RELE         0x311
+#define ID_FB_DIR          0x321
+#define ID_PARO_EMERGENCIA 0x210
 
-#define PIN_PWM         6
-#define PIN_DIR         9
-#define PIN_FEEDBACK    A0
-#define ACT_FLT         5
+// --- PINES DE HARDWARE ---
+#define MOTOR_PWM      A1
+#define RELAY_ENABLE   4
+#define MOTOR_DIR_REV  11
+#define CONFIG_L1      12   // marcha L1 (siempre HIGH)
+#define CONFIG_L2      13   // marcha L2 (siempre LOW)
 
-const int RAW_MIN = 815;
-const int RAW_MAX = 868;
-
-#define POS_NORMAL       100
-#define POS_FRENO          0
-#define POS_EMERGENCIA     0
-
-byte posicionObjetivo = POS_NORMAL;
-const int TOLERANCIA = 8;
-const unsigned long TIMEOUT_FUERA_RANGO_MS = 2000;
-
-// 🆕 WATCHDOG (timeout largo para no aplicar freno por glitches)
-const unsigned long WATCHDOG_TIMEOUT_MS = 1500;
+// --- WATCHDOG ---
+const unsigned long WATCHDOG_TIMEOUT_MS = 500;
 unsigned long lastCanRx = 0;
 bool masterOffline = false;
 
+// --- VARIABLES DE ESTADO ---
+int  velocidadObj    = 0;
+int  velocidadActual = 0;
+bool relayState      = false;
+bool direccion       = true;       // true = FWD por defecto
 bool modoEmergencia  = false;
-bool modoFreno       = false;
-bool errorPot        = false;
-bool paroFisico      = false;
-bool modoRecuperacion = false;
 
-unsigned long tFueraDeRango = 0;
+const int pwmMin = 0;
+const int pwmMax = 255;
 
-const int N = 5;
-int bufferLecturas[N];
-long sumaLecturas = 0;
-int indice        = 0;
-bool bufferLleno  = false;
-
-byte ultimoPWM       = 0;
-byte ultimaDireccion = 0;
-bool fueraDeRango    = false;
-
-// ================================================================
-int leerPotFiltrado() {
-  int nueva = analogRead(PIN_FEEDBACK);
-  sumaLecturas -= bufferLecturas[indice];
-  bufferLecturas[indice] = nueva;
-  sumaLecturas += nueva;
-  indice++;
-  if (indice >= N) { indice = 0; bufferLleno = true; }
-  return bufferLleno ? (sumaLecturas / N) : (sumaLecturas / indice);
-}
-
-byte lecturaToPorcentaje(int lecturaRaw) {
-  lecturaRaw = constrain(lecturaRaw, RAW_MIN, RAW_MAX);
-  int porcentaje = map(lecturaRaw, RAW_MAX, RAW_MIN, 0, 100);
-  return (byte)constrain(porcentaje, 0, 100);
-}
-
-bool detectarParoFisico() {
-  return (digitalRead(ACT_FLT) == LOW);
-}
-
-void enviarFeedbackCAN() {
+// =====================================================
+void enviarMensajeCAN(uint32_t id, uint8_t valor) {
   if (!canOK) return;
-  byte posicionActual = lecturaToPorcentaje(leerPotFiltrado());
-  mcp.beginPacket(ID_FB_FRENO);
-  mcp.write(posicionActual);
+  valor = constrain(valor, 0, 100);
+  mcp.beginPacket(id);
+  mcp.write(valor);
   mcp.endPacket();
 }
 
-void actualizarObjetivo() {
-  // 🆕 Si master offline, forzar freno
-  if (masterOffline) {
-    posicionObjetivo = POS_FRENO;
-    return;
-  }
-  if (modoEmergencia)   posicionObjetivo = POS_EMERGENCIA;
-  else if (modoFreno)   posicionObjetivo = POS_FRENO;
-  else                  posicionObjetivo = POS_NORMAL;
+void activarParoEmergencia() {
+  modoEmergencia  = true;
+  velocidadObj    = 0;
+  velocidadActual = 0;
+  relayState      = false;
+
+  analogWrite(MOTOR_PWM, 0);
+  digitalWrite(RELAY_ENABLE, LOW);
+
+  enviarMensajeCAN(ID_FB_PWM,  0);
+  enviarMensajeCAN(ID_FB_RELE, 0);
 }
 
-void motorOff() {
-  analogWrite(PIN_PWM, 0);
-  ultimoPWM = 0;
+// Modo seguro por watchdog (master se cayó)
+void entrarModoSeguro() {
+  velocidadObj    = 0;
+  velocidadActual = 0;
+  relayState      = false;
+  analogWrite(MOTOR_PWM, 0);
+  digitalWrite(RELAY_ENABLE, LOW);
+  // direccion y L1/L2 se mantienen como estaban
 }
 
-void moverActuadorHaciaObjetivo() {
-  paroFisico = detectarParoFisico();
-  int lectura = leerPotFiltrado();
-  unsigned long now = millis();
-  bool enRango = (lectura >= RAW_MIN && lectura <= RAW_MAX);
-
-  // Paro físico
-  if (paroFisico) {
-    motorOff();
-    fueraDeRango = !enRango;
-    tFueraDeRango = 0;
-    return;
-  }
-
-  // Recuperación
-  if (modoRecuperacion) {
-    if (paroFisico) {
-      motorOff();
-      return;
-    }
-    if (enRango) {
-      modoRecuperacion = false;
-      errorPot         = false;
-      fueraDeRango     = false;
-      tFueraDeRango    = 0;
-      motorOff();
-      return;
-    }
-    digitalWrite(PIN_DIR, HIGH);
-    analogWrite(PIN_PWM, 160);
-    ultimoPWM = 160;
-    ultimaDireccion = 1;
-    return;
-  }
-
-  // Error pot
-  if (errorPot) {
-    motorOff();
-    if (modoEmergencia || masterOffline) {
-      if (enRango) {
-        errorPot = false;
-      } else {
-        modoRecuperacion = true;
-      }
-    }
-    return;
-  }
-
-  // Fuera de rango sin paro físico
-  if (!enRango) {
-    if (!fueraDeRango) tFueraDeRango = now;
-    fueraDeRango = true;
-    if (now - tFueraDeRango > TIMEOUT_FUERA_RANGO_MS) {
-      errorPot = true;
-      motorOff();
-      return;
-    }
-    if (lectura < RAW_MIN) {
-      digitalWrite(PIN_DIR, LOW);
-      analogWrite(PIN_PWM, 160);
-      ultimoPWM = 160;
-      ultimaDireccion = 0;
-    } else {
-      digitalWrite(PIN_DIR, HIGH);
-      analogWrite(PIN_PWM, 160);
-      ultimoPWM = 160;
-      ultimaDireccion = 1;
-    }
-    return;
-  }
-
-  fueraDeRango  = false;
-  tFueraDeRango = 0;
-
-  byte posicionActual = lecturaToPorcentaje(lectura);
-  int  error = posicionObjetivo - posicionActual;
-
-  if (abs(error) <= TOLERANCIA) {
-    motorOff();
-    return;
-  }
-
-  if (error > 0) {
-    digitalWrite(PIN_DIR, HIGH);
-    ultimaDireccion = 1;
-  } else {
-    digitalWrite(PIN_DIR, LOW);
-    ultimaDireccion = 0;
-  }
-
-  byte pwmValor = map(abs(error), TOLERANCIA, 100, 140, 255);
-  pwmValor = constrain(pwmValor, 140, 255);
-  analogWrite(PIN_PWM, pwmValor);
-  ultimoPWM = pwmValor;
+void rampaPWM(int objetivo) {
+  objetivo = constrain(objetivo, 0, 100);
+  int pwmOut = map(objetivo, 0, 100, pwmMin, pwmMax);
+  velocidadActual = pwmOut;
+  analogWrite(MOTOR_PWM, velocidadActual);
 }
 
-// ================================================================
+// =====================================================
 void updateOLED() {
   display.clearDisplay();
 
+  // Header
   display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK);
   display.setTextSize(1);
   display.setCursor(2, 2);
-  display.print(F("AMR1 - FRENOS"));
+  display.print(F("AMR1 - TREN MOTRIZ"));
   display.setTextColor(SSD1306_WHITE);
 
-  // 🆕 PRIORIDAD MÁXIMA: master offline
-  if (masterOffline && !paroFisico) {
+  // Pantalla MASTER OFFLINE (prioridad máxima)
+  if (masterOffline) {
+    display.setTextSize(1);
     display.setCursor(0, 16);
     display.print(F("!! MASTER OFFLINE"));
     display.setCursor(0, 28);
@@ -237,122 +133,63 @@ void updateOLED() {
     display.print('.');
     display.print((offlineMs % 1000) / 100);
     display.print(F("s"));
-    display.setCursor(0, 42);
-    display.print(F("FRENO APLICADO"));
-    display.setCursor(0, 52);
-    display.print(F("(seguridad auto)"));
+
+    display.setCursor(0, 40);
+    display.print(F("MODO SEGURO:"));
+    display.setCursor(0, 50);
+    display.print(F("Vel=0 Relay=OFF"));
+
     display.display();
     return;
   }
 
-  if (paroFisico && !modoRecuperacion) {
-    display.setTextSize(2);
-    display.setCursor(8, 18);
-    display.print(F("PARO FIS"));
-    display.setTextSize(1);
-    display.setCursor(0, 40);
-    display.print(F("Boton rojo activo"));
-    display.setCursor(0, 50);
-    if ((millis() / 500) % 2 == 0) display.print(F("(esperando...)"));
-  }
-  else if (modoRecuperacion) {
-    display.setCursor(0, 16);
-    display.print(F("MODO: RECUPERACION"));
-    display.setCursor(0, 28);
-    display.print(F("Retrayendo a normal"));
-    display.setCursor(0, 40);
-    display.print(F("ACT_FLT: "));
-    display.print(paroFisico ? F("FAULT") : F("OK"));
-    display.setCursor(0, 50);
-    display.print(F("Pot: "));
-    display.print(leerPotFiltrado());
-  }
-  else if (modoEmergencia) {
+  if (modoEmergencia) {
     display.setTextSize(2);
     display.setCursor(10, 20);
     display.print(F("EMERG!"));
     display.setTextSize(1);
-  }
-  else if (fueraDeRango && !errorPot) {
-    display.setCursor(0, 18);
-    display.print(F("FUERA RANGO"));
-    display.setCursor(0, 28);
-    display.print(ultimaDireccion ? F("Retrayendo...") : F("Extendiendo..."));
-    unsigned long restanteMs = TIMEOUT_FUERA_RANGO_MS - (millis() - tFueraDeRango);
-    display.setCursor(0, 38);
-    display.print(F("Timeout: "));
-    display.print(restanteMs / 1000);
-    display.print('.');
-    display.print((restanteMs % 1000) / 100);
-    display.print('s');
-  }
-  else {
-    display.setCursor(0, 14);
-    display.print(F("MODO: "));
-    display.print(modoFreno ? F("FRENO") : F("NORMAL"));
-
-    display.setCursor(0, 24);
-    display.print(F("FLT:  "));
-    display.print(digitalRead(ACT_FLT) == LOW ? F("FAULT") : F("OK"));
-
-    display.setCursor(0, 34);
-    display.print(F("DIR:  "));
-    display.print(ultimaDireccion ? F("RETR ") : F("EXTND"));
-
-    display.setCursor(0, 44);
-    display.print(F("PWM:  "));
-    display.print(ultimoPWM);
-  }
-
-  byte actual;
-  if (errorPot && !modoRecuperacion) {
-    actual = 100;
   } else {
-    actual = lecturaToPorcentaje(leerPotFiltrado());
+    display.setCursor(0, 20);
+    display.print(F("Vel: ")); display.print(velocidadObj); display.print(F(" %"));
   }
-  display.drawRect(0, 54, 128, 10, SSD1306_WHITE);
-  int fill = map(actual, 0, 100, 0, 126);
-  if (fill > 0) display.fillRect(1, 55, fill, 8, SSD1306_WHITE);
 
-  if (errorPot && !modoRecuperacion && !paroFisico && !masterOffline) {
-    int boxX = 14, boxY = 18, boxW = 100, boxH = 28;
-    display.fillRect(boxX, boxY, boxW, boxH, SSD1306_WHITE);
-    display.drawRect(boxX + 2, boxY + 2, boxW - 4, boxH - 4, SSD1306_BLACK);
-    display.setTextColor(SSD1306_BLACK);
-    display.setTextSize(1);
-    display.setCursor(boxX + 28, boxY + 4);
-    display.print(F("!!ERROR!!"));
-    display.setCursor(boxX + 6, boxY + 14);
-    display.print(F("Pot fuera rango"));
-    display.setCursor(boxX + 12, boxY + 22);
-    if ((millis() / 500) % 2 == 0) display.print(F("Desactiva enable"));
-    display.setTextColor(SSD1306_WHITE);
-  }
+  display.setCursor(0, 35);
+  display.print(F("Rele: ")); display.print(relayState ? F("ON") : F("OFF"));
+  display.setCursor(64, 35);
+  display.print(F("Dir: ")); display.print(direccion ? F("FWD") : F("REV"));
+
+  display.setCursor(0, 44);
+  display.print(canOK ? F("CAN OK") : F("CAN ERR"));
+
+  display.drawRect(0, 54, 128, 10, SSD1306_WHITE);
+  int fill = map(velocidadObj, 0, 100, 0, 126);
+  if (fill > 0) display.fillRect(1, 55, fill, 8, SSD1306_WHITE);
 
   display.display();
 }
 
-// ================================================================
+// =====================================================
 void setup() {
   Serial.begin(115200);
 
+  // --- HARDWARE INIT ---
+  pinMode(MOTOR_PWM, OUTPUT);
+  pinMode(RELAY_ENABLE, OUTPUT);
+  pinMode(MOTOR_DIR_REV, OUTPUT);
+  pinMode(CONFIG_L1, OUTPUT);
+  pinMode(CONFIG_L2, OUTPUT);
+
+  // Marchas hardcoded (L1=HIGH, L2=LOW)
+  digitalWrite(CONFIG_L1, HIGH);
+  digitalWrite(CONFIG_L2, LOW);
+
+  digitalWrite(RELAY_ENABLE, LOW);
+  digitalWrite(MOTOR_DIR_REV, LOW);   // INVERTIDO: LOW=FWD (era HIGH)
+  analogWrite(MOTOR_PWM, 0);
   analogWriteFreq(10000);
   analogWriteRange(255);
 
-  pinMode(PIN_PWM, OUTPUT);
-  pinMode(PIN_DIR, OUTPUT);
-  pinMode(ACT_FLT, INPUT_PULLUP);
-  analogWrite(PIN_PWM, 0);
-  digitalWrite(PIN_DIR, LOW);
-
-  for (int i = 0; i < N; i++) {
-    bufferLecturas[i] = analogRead(PIN_FEEDBACK);
-    sumaLecturas += bufferLecturas[i];
-    delay(2);
-  }
-  bufferLleno = true;
-  posicionObjetivo = POS_NORMAL;
-
+  // --- OLED INIT ---
   Wire.begin();
   if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     displayOK = true;
@@ -360,13 +197,14 @@ void setup() {
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
     display.setCursor(10, 20);
-    display.print(F("FRENOS v2.5 INIT"));
+    display.print(F("TREN MOTRIZ v2.5"));
     display.setCursor(10, 32);
-    display.print(F("Watchdog 1500ms"));
+    display.print(F("Watchdog 500ms"));
     display.display();
-    delay(800);
+    delay(500);
   }
 
+  // --- CAN INIT ---
   pinMode(PIN_CAN_STANDBY, OUTPUT);
   digitalWrite(PIN_CAN_STANDBY, LOW);
   pinMode(PIN_CAN_RESET, OUTPUT);
@@ -379,59 +217,110 @@ void setup() {
     canOK = true;
   }
 
-  // 🆕 Watchdog inicia ofline
+  if (displayOK) {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(10, 20);
+    display.print(canOK ? F("CAN OK") : F("CAN ERR"));
+    display.display();
+    delay(500);
+  }
+
+  // Watchdog inicia en offline (esperando primer comando del master)
   lastCanRx = millis();
   masterOffline = true;
 }
 
+// =====================================================
 void loop() {
   unsigned long now = millis();
 
+  // Drenar TODOS los paquetes CAN pendientes
   while (canOK) {
     int len = mcp.parsePacket();
     if (len <= 0) break;
     uint32_t id = mcp.packetId();
 
-    // 🆕 IDs relevantes para frenos
-    bool idRelevante = (id == ID_CMD_FRENO || id == ID_EMERGENCIA);
+    // Reseteo del watchdog con IDs relevantes
+    bool idRelevante = (id == ID_CMD_PWM       ||
+                        id == ID_CMD_RELE      ||
+                        id == ID_CMD_DIR       ||
+                        id == ID_PARO_EMERGENCIA);
     if (idRelevante) {
       lastCanRx = now;
       if (masterOffline) {
         masterOffline = false;
-        actualizarObjetivo();
       }
     }
 
-    if (id == ID_EMERGENCIA && mcp.available()) {
+    // ─── EMERGENCIA: prioridad máxima ─────────────────
+    if (id == ID_PARO_EMERGENCIA && mcp.available()) {
       byte em = mcp.read();
-      if (em == 1) {
-        modoEmergencia = true;
-        modoFreno      = false;
-      } else if (em == 0) {
-        modoEmergencia = false;
-      }
-      actualizarObjetivo();
-      enviarFeedbackCAN();
+      if (em == 1) activarParoEmergencia();
+      else if (em == 0) modoEmergencia = false;
+      continue;
     }
-    else if (id == ID_CMD_FRENO && !modoEmergencia && mcp.available()) {
-      byte cmd = mcp.read();
-      modoFreno = (cmd >= 90);
-      actualizarObjetivo();
-      enviarFeedbackCAN();
-    }
-    else {
+
+    // ─── Si offline o emergencia, drenar y saltar ─────
+    if (modoEmergencia || masterOffline) {
       while (mcp.available()) mcp.read();
+      continue;
     }
+
+    // ─── Comando velocidad ─────────────────────────────
+    if (id == ID_CMD_PWM && mcp.available()) {
+      velocidadObj = mcp.read();
+      velocidadObj = constrain(velocidadObj, 0, 100);
+      enviarMensajeCAN(ID_FB_PWM, velocidadObj);
+      continue;
+    }
+
+    // ─── Comando relé ─────────────────────────────────
+    if (id == ID_CMD_RELE && mcp.available()) {
+      relayState = (mcp.read() > 0);
+      if (!relayState) {                  // apagar motor antes de abrir relé
+        velocidadObj    = 0;
+        velocidadActual = 0;
+        analogWrite(MOTOR_PWM, 0);
+      }
+      digitalWrite(RELAY_ENABLE, relayState ? HIGH : LOW);
+      enviarMensajeCAN(ID_FB_RELE, relayState);
+      continue;
+    }
+
+    // ─── Comando dirección (reversa) ──────────────────
+    if (id == ID_CMD_DIR && mcp.available()) {
+      bool nuevaDir = (mcp.read() > 0);
+      if (nuevaDir != direccion) {        // parar antes de invertir
+        velocidadObj    = 0;
+        velocidadActual = 0;
+        analogWrite(MOTOR_PWM, 0);
+        delay(150);
+        direccion = nuevaDir;
+      }
+      // INVERTIDO: direccion=true (FWD) → pin LOW
+      digitalWrite(MOTOR_DIR_REV, direccion ? LOW : HIGH);
+      enviarMensajeCAN(ID_FB_DIR, direccion);
+      continue;
+    }
+
+    // ─── ID no relevante: drenar bytes ───────────────
+    while (mcp.available()) mcp.read();
   }
 
-  // 🆕 Verificar watchdog
+  // Verificar watchdog
   if (!masterOffline && (now - lastCanRx > WATCHDOG_TIMEOUT_MS)) {
     masterOffline = true;
-    actualizarObjetivo();   // fuerza freno
+    entrarModoSeguro();
   }
 
-  moverActuadorHaciaObjetivo();
+  // Control PWM (solo si activo)
+  if (!modoEmergencia && !masterOffline) {
+    rampaPWM(velocidadObj);
+  }
 
+  // OLED a 10Hz
   static unsigned long lastOLED = 0;
   if (now - lastOLED >= 100) {
     lastOLED = now;

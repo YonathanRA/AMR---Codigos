@@ -1,16 +1,22 @@
 /*
  * ================================================================
- *   FEATHER RP2040 CAN — SUBSISTEMA FRENOS  v2.5
+ *   FEATHER RP2040 CAN — SUBSISTEMA FRENOS  v2.6
  *
- *   Mejoras v2.5:
- *   - WATCHDOG: si master no manda en 1500ms → aplicar freno
- *   - Timeout más largo para evitar freno fantasma por glitches
- *   - Rearme: cuando llega comando 0x200 o 0x210 del master
+ *   Cambios v2.6:
+ *   - Freno PROPORCIONAL: cmd 0-100 mapea posición 100-0
+ *     (antes binario: solo frenaba si cmd >= 90)
  *
- *   Funcionalidad heredada:
- *   - Detección paro físico vía ACT_FLT
- *   - Modo recuperación
- *   - Error de pot persistente
+ *   Funcionalidad:
+ *   - Tolerancia 8 (zona muerta amplia, frenado rápido)
+ *   - Timeout fuera de rango 2 seg → errorPot
+ *   - Detección paro físico vía ACT_FLT (botón rojo)
+ *   - Modo recuperación tras desactivar enables
+ *   - Watchdog 1500ms (aplica freno si master se cae)
+ *   - Drenado completo de cola CAN
+ *
+ *   ESCALA INVERTIDA:
+ *   27%  = extendido (freno/emergencia) → ADC 868
+ *   100% = retraído  (normal)           → ADC 815
  * ================================================================
  */
 
@@ -51,15 +57,14 @@ byte posicionObjetivo = POS_NORMAL;
 const int TOLERANCIA = 8;
 const unsigned long TIMEOUT_FUERA_RANGO_MS = 2000;
 
-// 🆕 WATCHDOG (timeout largo para no aplicar freno por glitches)
 const unsigned long WATCHDOG_TIMEOUT_MS = 1500;
 unsigned long lastCanRx = 0;
 bool masterOffline = false;
 
-bool modoEmergencia  = false;
-bool modoFreno       = false;
-bool errorPot        = false;
-bool paroFisico      = false;
+bool modoEmergencia   = false;
+byte modoFreno        = 0;     // 0 = sin freno, 1-100 = freno proporcional
+bool errorPot         = false;
+bool paroFisico       = false;
 bool modoRecuperacion = false;
 
 unsigned long tFueraDeRango = 0;
@@ -104,14 +109,16 @@ void enviarFeedbackCAN() {
 }
 
 void actualizarObjetivo() {
-  // 🆕 Si master offline, forzar freno
   if (masterOffline) {
     posicionObjetivo = POS_FRENO;
     return;
   }
-  if (modoEmergencia)   posicionObjetivo = POS_EMERGENCIA;
-  else if (modoFreno)   posicionObjetivo = POS_FRENO;
-  else                  posicionObjetivo = POS_NORMAL;
+  if (modoEmergencia) {
+    posicionObjetivo = POS_EMERGENCIA;
+  } else {
+    // cmd=0 → POS_NORMAL(100), cmd=100 → POS_FRENO(0)
+    posicionObjetivo = (byte)constrain(100 - (int)modoFreno, POS_FRENO, POS_NORMAL);
+  }
 }
 
 void motorOff() {
@@ -119,6 +126,7 @@ void motorOff() {
   ultimoPWM = 0;
 }
 
+// ================================================================
 void moverActuadorHaciaObjetivo() {
   paroFisico = detectarParoFisico();
   int lectura = leerPotFiltrado();
@@ -154,7 +162,7 @@ void moverActuadorHaciaObjetivo() {
     return;
   }
 
-  // Error pot
+  // Error pot persistente
   if (errorPot) {
     motorOff();
     if (modoEmergencia || masterOffline) {
@@ -226,7 +234,6 @@ void updateOLED() {
   display.print(F("AMR1 - FRENOS"));
   display.setTextColor(SSD1306_WHITE);
 
-  // 🆕 PRIORIDAD MÁXIMA: master offline
   if (masterOffline && !paroFisico) {
     display.setCursor(0, 16);
     display.print(F("!! MASTER OFFLINE"));
@@ -289,7 +296,13 @@ void updateOLED() {
   else {
     display.setCursor(0, 14);
     display.print(F("MODO: "));
-    display.print(modoFreno ? F("FRENO") : F("NORMAL"));
+    if (modoFreno > 0) {
+      display.print(F("FRENO "));
+      display.print(modoFreno);
+      display.print('%');
+    } else {
+      display.print(F("NORMAL"));
+    }
 
     display.setCursor(0, 24);
     display.print(F("FLT:  "));
@@ -360,7 +373,7 @@ void setup() {
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
     display.setCursor(10, 20);
-    display.print(F("FRENOS v2.5 INIT"));
+    display.print(F("FRENOS v2.6 INIT"));
     display.setCursor(10, 32);
     display.print(F("Watchdog 1500ms"));
     display.display();
@@ -379,11 +392,11 @@ void setup() {
     canOK = true;
   }
 
-  // 🆕 Watchdog inicia ofline
   lastCanRx = millis();
   masterOffline = true;
 }
 
+// ================================================================
 void loop() {
   unsigned long now = millis();
 
@@ -392,7 +405,6 @@ void loop() {
     if (len <= 0) break;
     uint32_t id = mcp.packetId();
 
-    // 🆕 IDs relevantes para frenos
     bool idRelevante = (id == ID_CMD_FRENO || id == ID_EMERGENCIA);
     if (idRelevante) {
       lastCanRx = now;
@@ -415,7 +427,7 @@ void loop() {
     }
     else if (id == ID_CMD_FRENO && !modoEmergencia && mcp.available()) {
       byte cmd = mcp.read();
-      modoFreno = (cmd >= 90);
+      modoFreno = constrain(cmd, 0, 100);
       actualizarObjetivo();
       enviarFeedbackCAN();
     }
@@ -424,10 +436,9 @@ void loop() {
     }
   }
 
-  // 🆕 Verificar watchdog
   if (!masterOffline && (now - lastCanRx > WATCHDOG_TIMEOUT_MS)) {
     masterOffline = true;
-    actualizarObjetivo();   // fuerza freno
+    actualizarObjetivo();
   }
 
   moverActuadorHaciaObjetivo();

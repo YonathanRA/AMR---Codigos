@@ -36,7 +36,54 @@
 
 ## Lógica de control
 
-> _Describir rampa PWM, rango de valores (0–100 %), comportamiento en emergencia, etc._
+### Flujo CAN
+
+```
+Master (Intérprete)
+  │
+  │  0x310 — relay enable (1/0)
+  │  0x320 — dirección (0=FWD, 1=REV)
+  │  0x300 — velocidad [0-100 %]
+  │  0x210 — emergencia (1/0)
+  ▼
+Feather RP2040 (tren_motriz_can)
+  │  velocidad → map(0-100%, 0-255) → PWM
+  │  relay: HIGH = habilitado
+  │  dirección: MOTOR_DIR_REV LOW=FWD, HIGH=REV (cableado invertido)
+  │
+  │  0x301 — feedback velocidad
+  │  0x311 — feedback relé
+  │  0x321 — feedback dirección
+  ▼
+Master (Intérprete)
+```
+
+### Cambio de dirección
+
+Antes de invertir la dirección el firmware para completamente el motor (PWM=0)
+y espera 150 ms para evitar picos de corriente al revertir con el motor girando.
+
+### Control del relé
+
+Antes de abrir el relé (desactivar) el firmware pone PWM=0 para evitar arco
+eléctrico en los contactos.
+
+### Watchdog
+
+Si no se recibe ningún ID relevante (0x300, 0x310, 0x320, 0x210) durante 500 ms,
+el nodo entra en modo seguro: PWM=0 y relé abierto. Se reactiva al recibir el primer
+mensaje CAN del master.
+
+### Marchas (hardcoded)
+
+| Pin        | Estado | Descripción                |
+|------------|--------|----------------------------|
+| CONFIG_L1  | HIGH   | Marcha L1 siempre activa   |
+| CONFIG_L2  | LOW    | Marcha L2 siempre inactiva |
+
+### Emergencia (0x210=1)
+
+Motor a 0, relé abierto. Se resetea al recibir 0x210=0 del master.
 
 ## Calibración (modo Serial)
 

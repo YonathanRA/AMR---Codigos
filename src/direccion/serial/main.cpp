@@ -36,17 +36,17 @@
 #define PIN_POT   A0
 
 // ── EEPROM ─────────────────────────────────────────────────────
-#define EEPROM_SIZE  10
-#define MAGIC_VAL    0xCA51
+#define EEPROM_SIZE  14       // 2(magic) + 4(left) + 4(mid) + 4(right)
+#define MAGIC_VAL    0xCA52  // valor nuevo para invalidar EEPROM vieja corrupta
 #define ADDR_MAGIC   0
 #define ADDR_LEFT    2
-#define ADDR_MID     4
-#define ADDR_RIGHT   6
+#define ADDR_MID     6       // FIX: int = 4 bytes, no 2
+#define ADDR_RIGHT   10      // FIX: corrido 4 bytes desde MID
 
 // ── Puntos de calibración (RAW ADC, 0-4095) ────────────────────
-int rawLeft  = 1200;   // posición IZQUIERDA  (~1198-1201)
-int rawMid   = 2006;   // posición MEDIA      (~2004-2008)
-int rawRight = 2740;   // posición DERECHA    (~2738-2743)
+int rawLeft  = 1242;   // posición IZQUIERDA  (~1198-1201)
+int rawMid   = 2005;   // posición MEDIA      (~2004-2008)
+int rawRight = 2865;   // posición DERECHA    (~2738-2743)
 
 // ── Control ────────────────────────────────────────────────────
 const int TOLERANCIA_PCT = 2;   // % de error aceptable para "llegó"
