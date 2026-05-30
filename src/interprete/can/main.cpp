@@ -1,26 +1,47 @@
-/**
+/*
  * ================================================================
- * AMR1 - CONTROL MASTER DASHBOARD PRO v2.4
+ * AMR1 - CONTROL MASTER DASHBOARD PRO v2.7
  * Hardware: Adafruit Feather RP2040 CAN
  * ================================================================
  *
- * NUEVO v2.4:
- *   - INTERLOCK FRENO-MOTOR: si freno > 7%, valorVel se fuerza a 0
- *   - Relé queda activo (más rápida liberación)
- *   - Se mantiene throttle/freno excluyentes desde v2.3
+ * Historial de versiones:
+ * v2.3 — Freno proporcional CH1. Zona muerta throttle 911-1100.
+ *         Throttle/freno excluyentes.
+ * v2.4 — Interlock freno-motor (umbral 7%). Tag LOCK en OLED.
+ *         Relé activo en freno para liberación rápida.
+ * v2.5 — Mutex Core0/Core1: protege vehicle.* contra race
+ *         condition. parseSBUS() escribe con mutex. TX y OLED
+ *         leen con mutex.
+ * v2.6 — CH2 invertido: map(172,1811,0,100) corrige dirección
+ *         física del vehículo.
+ *         Emergencia separada en dos flags:
+ *           hayEmergMotriz = signalLost || !enable
+ *             → bloquea tren motriz + frenos (0x210)
+ *           hayEmergDir = signalLost SOLO
+ *             → bloquea dirección (0x211, ID nuevo)
+ *         Cuando CH5=-100: freno=100, motor=0, pero dirección
+ *         sigue operativa para maniobrar en frenado.
+ * v2.7 — Freno remapeado al rango físico efectivo (0→BRAKE_MAX_EFFECTIVE).
+ *         El actuador no frena por encima de 60%; mapear hasta 100
+ *         desperdiciaba recorrido de palanca.
+ *         Zona de seguridad: valores ≤ UMBRAL_FRENO_BLOQUEO (7%) se
+ *         redondean a 0 para evitar bloquear el motor por ruido/holgura.
  *
  * MAPA CAN:
  *   TX 0x100 → Comando dirección
- *   TX 0x200 → Comando freno PROPORCIONAL (0-100%)
- *   TX 0x210 → Emergencia (broadcast)
+ *   TX 0x200 → Comando freno proporcional (0-100%)
+ *   TX 0x210 → Emergencia motriz (tren + frenos)
+ *   TX 0x211 → Emergencia dirección (solo failsafe real)
  *   TX 0x300 → Velocidad
  *   TX 0x310 → Enable relay
  *   TX 0x320 → Reversa
- *   TX 0x330 → High gear (informativo)
+ *   TX 0x330 → High gear
  *   RX 0x101 → Feedback dirección
+ * ================================================================
  */
 
 #include "hardware/gpio.h"
+#include "pico/mutex.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_MCP2515.h>
 #include <Adafruit_SSD1306.h>
@@ -28,18 +49,16 @@
 #include <SPI.h>
 #include <Wire.h>
 
-// ================================================================
-//  SBUS PINOUT
-// ================================================================
+// ── SBUS ──────────────────────────────────────────────────────
 #define SBUS_PIN_RX  1
 #define BAUD_SBUS    100000
 
-// --- CAN BUS ---
+// ── CAN ───────────────────────────────────────────────────────
 #define CAN_BAUDRATE 250000
 Adafruit_MCP2515 mcp(PIN_CAN_CS);
 bool canOK = false;
 
-// --- OLED ---
+// ── OLED ──────────────────────────────────────────────────────
 #define SCREEN_WIDTH    128
 #define SCREEN_HEIGHT   64
 #define OLED_RESET      -1
@@ -47,9 +66,7 @@ bool canOK = false;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool displayOK = false;
 
-// ================================================================
-//  CANALES SBUS
-// ================================================================
+// ── Canales SBUS ──────────────────────────────────────────────
 #define CH_THROTTLE  0
 #define CH_STEERING  1
 #define CH_EMERG_A   2
@@ -61,7 +78,6 @@ bool displayOK = false;
 #define CH7_HIGH   1300
 #define CH7_LOW    700
 
-// Zonas de la palanca de throttle
 #define THROTTLE_MIN          172
 #define THROTTLE_FRENA_TOP    910
 #define THROTTLE_DEAD_BOT     911
@@ -72,24 +88,21 @@ bool displayOK = false;
 #define VEL_MAX_LOW   120
 #define VEL_MAX_HIGH  200
 
-// 🆕 INTERLOCK FRENO-MOTOR
-#define UMBRAL_FRENO_BLOQUEO  7   // si freno > este valor → motor bloqueado
+#define UMBRAL_FRENO_BLOQUEO  7
+#define BRAKE_MIN_EFFECTIVE   40   // actuador físico: empieza a frenar desde 40%
 
-// ================================================================
-//  CAN IDs
-// ================================================================
+// ── CAN IDs ───────────────────────────────────────────────────
 #define CAN_TX_DIR        0x100
 #define CAN_TX_BRAKE      0x200
-#define CAN_TX_EMERG      0x210
+#define CAN_TX_EMERG      0x210   // emergencia motriz (tren + frenos)
+#define CAN_TX_EMERG_DIR  0x211   // emergencia dirección (solo failsafe)
 #define CAN_TX_VEL        0x300
 #define CAN_TX_ENABLE     0x310
 #define CAN_TX_REVERSA    0x320
 #define CAN_TX_HIGHGEAR   0x330
 #define CAN_RX_DIR_FB     0x101
 
-// ================================================================
-//  GLOBAL STATE
-// ================================================================
+// ── Estado global + mutex ─────────────────────────────────────
 struct SBUS_State {
   uint16_t ch[16];
   bool failsafe;
@@ -100,103 +113,112 @@ struct SBUS_State {
   int valorEnable;
   int valorReversa;
   bool highGear;
-  bool motorBloqueado;   // 🆕 indica si el interlock está activo
+  bool motorBloqueado;
 };
 
 volatile SBUS_State vehicle;
+mutex_t vehicleMutex;
 
-byte           dirFeedback        = 50;
-unsigned long  lastDirFeedback    = 0;
-unsigned long  cntFeedbackRx      = 0;
-bool           dirFeedbackOnline  = false;
+byte           dirFeedback       = 50;
+unsigned long  lastDirFeedback   = 0;
+unsigned long  cntFeedbackRx     = 0;
+bool           dirFeedbackOnline = false;
 
 // ================================================================
-//  SBUS DECODING (CORE 1)
+// SBUS DECODING (CORE 1)
 // ================================================================
 void parseSBUS(uint8_t *packet) {
-  vehicle.ch[0]  = ((packet[1]    | packet[2]  << 8)                    & 0x07FF);
-  vehicle.ch[1]  = ((packet[2]>>3 | packet[3]  << 5)                    & 0x07FF);
-  vehicle.ch[2]  = ((packet[3]>>6 | packet[4]  << 2 | packet[5]  << 10) & 0x07FF);
-  vehicle.ch[3]  = ((packet[5]>>1 | packet[6]  << 7)                    & 0x07FF);
-  vehicle.ch[4]  = ((packet[6]>>4 | packet[7]  << 4)                    & 0x07FF);
-  vehicle.ch[5]  = ((packet[7]>>7 | packet[8]  << 1 | packet[9]  << 9)  & 0x07FF);
-  vehicle.ch[6]  = ((packet[9]>>2 | packet[10] << 6)                    & 0x07FF);
-  vehicle.ch[7]  = ((packet[10]>>5| packet[11] << 3)                    & 0x07FF);
-  vehicle.ch[8]  = ((packet[12]   | packet[13] << 8)                    & 0x07FF);
-  vehicle.ch[9]  = ((packet[13]>>3| packet[14] << 5)                    & 0x07FF);
-  vehicle.ch[10] = ((packet[14]>>6| packet[15] << 2 | packet[16] << 10) & 0x07FF);
-  vehicle.ch[11] = ((packet[16]>>1| packet[17] << 7)                    & 0x07FF);
-  vehicle.ch[12] = ((packet[17]>>4| packet[18] << 4)                    & 0x07FF);
-  vehicle.ch[13] = ((packet[18]>>7| packet[19] << 1 | packet[20] << 9)  & 0x07FF);
-  vehicle.ch[14] = ((packet[20]>>2| packet[21] << 6)                    & 0x07FF);
-  vehicle.ch[15] = ((packet[21]>>5| packet[22] << 3)                    & 0x07FF);
 
-  vehicle.failsafe = packet[23] & 0x08;
+  uint16_t ch[16];
+  ch[0]  = ((packet[1]    | packet[2]  << 8)                    & 0x07FF);
+  ch[1]  = ((packet[2]>>3 | packet[3]  << 5)                    & 0x07FF);
+  ch[2]  = ((packet[3]>>6 | packet[4]  << 2 | packet[5]  << 10) & 0x07FF);
+  ch[3]  = ((packet[5]>>1 | packet[6]  << 7)                    & 0x07FF);
+  ch[4]  = ((packet[6]>>4 | packet[7]  << 4)                    & 0x07FF);
+  ch[5]  = ((packet[7]>>7 | packet[8]  << 1 | packet[9]  << 9)  & 0x07FF);
+  ch[6]  = ((packet[9]>>2 | packet[10] << 6)                    & 0x07FF);
+  ch[7]  = ((packet[10]>>5| packet[11] << 3)                    & 0x07FF);
+  ch[8]  = ((packet[12]   | packet[13] << 8)                    & 0x07FF);
+  ch[9]  = ((packet[13]>>3| packet[14] << 5)                    & 0x07FF);
+  ch[10] = ((packet[14]>>6| packet[15] << 2 | packet[16] << 10) & 0x07FF);
+  ch[11] = ((packet[16]>>1| packet[17] << 7)                    & 0x07FF);
+  ch[12] = ((packet[17]>>4| packet[18] << 4)                    & 0x07FF);
+  ch[13] = ((packet[18]>>7| packet[19] << 1 | packet[20] << 9)  & 0x07FF);
+  ch[14] = ((packet[20]>>2| packet[21] << 6)                    & 0x07FF);
+  ch[15] = ((packet[21]>>5| packet[22] << 3)                    & 0x07FF);
 
-  vehicle.valorDir = map(vehicle.ch[CH_STEERING], 172, 1811, 100, 0);
+  bool failsafe_local = packet[23] & 0x08;
 
-  uint16_t v7 = vehicle.ch[CH_GEAR_REV];
+  // FIX v2.6: CH2 invertido — map 0→100 en lugar de 100→0
+  int valorDir_local = map(ch[CH_STEERING], 172, 1811, 0, 100);
+
+  int  valorReversa_local = 0;
+  bool highGear_local     = false;
+  uint16_t v7 = ch[CH_GEAR_REV];
   if (v7 > CH7_HIGH) {
-    vehicle.valorReversa = 1;
-    vehicle.highGear     = false;
+    valorReversa_local = 1;
+    highGear_local     = false;
   } else if (v7 < CH7_LOW) {
-    vehicle.valorReversa = 0;
-    vehicle.highGear     = true;
-  } else {
-    vehicle.valorReversa = 0;
-    vehicle.highGear     = false;
+    valorReversa_local = 0;
+    highGear_local     = true;
   }
 
-  // ────────────────────────────────────────────────────────
-  // LÓGICA DE THROTTLE + FRENO PROPORCIONAL
-  // ────────────────────────────────────────────────────────
-  uint16_t throttle = vehicle.ch[CH_THROTTLE];
+  int valorVel_local   = 0;
+  int valorFreno_local = 0;
+  uint16_t throttle = ch[CH_THROTTLE];
 
   if (throttle >= THROTTLE_ACEL_BOT) {
-    // Zona ACELERA
-    int volMax = (vehicle.highGear && !vehicle.valorReversa)
-                   ? VEL_MAX_HIGH
-                   : VEL_MAX_LOW;
-    vehicle.valorVel   = map(throttle, THROTTLE_ACEL_BOT, THROTTLE_MAX, 50, volMax);
-    vehicle.valorFreno = 0;
-  }
-  else if (throttle <= THROTTLE_FRENA_TOP) {
-    // Zona FRENA proporcional
-    vehicle.valorVel   = 0;
-    vehicle.valorFreno = map(throttle, THROTTLE_MIN, THROTTLE_FRENA_TOP, 100, 1);
-  }
-  else {
-    // Zona MUERTA
-    vehicle.valorVel   = 0;
-    vehicle.valorFreno = 0;
+    int volMax = (highGear_local && !valorReversa_local)
+                   ? VEL_MAX_HIGH : VEL_MAX_LOW;
+    valorVel_local   = map(throttle, THROTTLE_ACEL_BOT, THROTTLE_MAX, 50, volMax);
+    valorFreno_local = 0;
+  } else if (throttle <= THROTTLE_FRENA_TOP) {
+    valorVel_local = 0;
+    // Mapear palanca al rango 0-100 primero
+    int rawBrake = map(throttle, THROTTLE_MIN, THROTTLE_FRENA_TOP, 100, 0);
+    // Deadzone: por debajo del umbral de seguridad no frenar
+    // Por encima: escalar al rango físico efectivo (BRAKE_MIN_EFFECTIVE→100)
+    if (rawBrake <= UMBRAL_FRENO_BLOQUEO) {
+      valorFreno_local = 0;
+    } else {
+      valorFreno_local = map(rawBrake, UMBRAL_FRENO_BLOQUEO, 100, BRAKE_MIN_EFFECTIVE, 100);
+    }
   }
 
-  bool emerg_ch3  = (vehicle.ch[CH_EMERG_A] > SBUS_HIGH);
-  bool enable_ch5 = (vehicle.ch[CH_ENABLE]  > SBUS_HIGH);
+  // Hombre muerto: CH3 + CH5
+  bool emerg_ch3  = (ch[CH_EMERG_A] > SBUS_HIGH);
+  bool enable_ch5 = (ch[CH_ENABLE]  > SBUS_HIGH);
 
-  // En emergencia/enable OFF: freno máximo
+  int valorEnable_local = 1;
   if (emerg_ch3 || !enable_ch5) {
-    vehicle.valorFreno   = 100;
-    vehicle.valorVel     = 0;
-    vehicle.valorReversa = 0;
-    vehicle.valorEnable  = 0;
-  } else {
-    vehicle.valorEnable = 1;
+    valorFreno_local   = 100;
+    valorVel_local     = 0;
+    valorReversa_local = 0;
+    valorEnable_local  = 0;
+    // NOTA v2.6: dirección NO se bloquea aquí — se bloquea
+    // solo por failsafe real vía 0x211
   }
 
-  // ────────────────────────────────────────────────────────
-  // 🆕 INTERLOCK FRENO-MOTOR
-  // Si hay freno aplicado (> umbral), el motor NO puede moverse
-  // ────────────────────────────────────────────────────────
-  if (vehicle.valorFreno > UMBRAL_FRENO_BLOQUEO) {
-    vehicle.valorVel       = 0;
-    vehicle.motorBloqueado = true;
-  } else {
-    vehicle.motorBloqueado = false;
+  // Interlock freno-motor
+  bool motorBloqueado_local = false;
+  if (valorFreno_local > UMBRAL_FRENO_BLOQUEO) {
+    valorVel_local       = 0;
+    motorBloqueado_local = true;
   }
 
-  if (!vehicle.failsafe)
-    vehicle.last_update = millis();
+  // Escritura atómica
+  mutex_enter_blocking(&vehicleMutex);
+  for (int i = 0; i < 16; i++) vehicle.ch[i] = ch[i];
+  vehicle.failsafe       = failsafe_local;
+  vehicle.valorDir       = valorDir_local;
+  vehicle.valorVel       = valorVel_local;
+  vehicle.valorFreno     = valorFreno_local;
+  vehicle.valorEnable    = valorEnable_local;
+  vehicle.valorReversa   = valorReversa_local;
+  vehicle.highGear       = highGear_local;
+  vehicle.motorBloqueado = motorBloqueado_local;
+  if (!failsafe_local) vehicle.last_update = millis();
+  mutex_exit(&vehicleMutex);
 }
 
 void setup1() {
@@ -219,14 +241,13 @@ void loop1() {
 }
 
 // ================================================================
-//  CAN RX
+// CAN RX
 // ================================================================
 void leerCANEntrante() {
   if (!canOK) return;
   while (true) {
     int packetSize = mcp.parsePacket();
     if (packetSize <= 0) break;
-
     long id = mcp.packetId();
     if (id == CAN_RX_DIR_FB && mcp.available()) {
       byte fb = mcp.read();
@@ -241,46 +262,74 @@ void leerCANEntrante() {
 }
 
 // ================================================================
-//  CAN TX
+// CAN TX
 // ================================================================
 void sendCANTelemetry() {
   if (!canOK) return;
 
-  bool signalLost = vehicle.failsafe || (millis() - vehicle.last_update > 500);
-  bool hayEmerg = signalLost || !vehicle.valorEnable;
+  mutex_enter_blocking(&vehicleMutex);
+  int   dir          = vehicle.valorDir;
+  int   vel          = vehicle.valorVel;
+  int   freno        = vehicle.valorFreno;
+  int   enable       = vehicle.valorEnable;
+  int   reversa      = vehicle.valorReversa;
+  bool  hg           = vehicle.highGear;
+  bool  fs           = vehicle.failsafe;
+  unsigned long upd  = vehicle.last_update;
+  mutex_exit(&vehicleMutex);
 
+  bool signalLost = fs || (millis() - upd > 500);
+
+  // v2.6: dos flags de emergencia separados
+  // hayEmergMotriz: bloquea tren motriz + frenos
+  bool hayEmergMotriz = signalLost || !enable;
+  // hayEmergDir: bloquea dirección SOLO en pérdida real de señal
+  bool hayEmergDir    = signalLost;
+
+  // Dirección — se manda siempre salvo pérdida de señal
   mcp.beginPacket(CAN_TX_DIR);
-  mcp.write((byte)vehicle.valorDir);
+  mcp.write((byte)dir);
   mcp.endPacket();
 
+  // Emergencia motriz (tren + frenos)
   mcp.beginPacket(CAN_TX_EMERG);
-  mcp.write((byte)(hayEmerg ? 1 : 0));
+  mcp.write((byte)(hayEmergMotriz ? 1 : 0));
   mcp.endPacket();
 
+  // Emergencia dirección (solo failsafe real)
+  mcp.beginPacket(CAN_TX_EMERG_DIR);
+  mcp.write((byte)(hayEmergDir ? 1 : 0));
+  mcp.endPacket();
+
+  // Freno
   mcp.beginPacket(CAN_TX_BRAKE);
-  byte cmdFreno = hayEmerg ? 100 : (byte)vehicle.valorFreno;
+  byte cmdFreno = hayEmergMotriz ? 100 : (byte)freno;
   mcp.write(cmdFreno);
   mcp.endPacket();
 
+  // Velocidad
   mcp.beginPacket(CAN_TX_VEL);
-  mcp.write((byte)map(vehicle.valorVel, 0, VEL_MAX_HIGH, 0, 100));
+  mcp.write((byte)map(vel, 0, VEL_MAX_HIGH, 0, 100));
   mcp.endPacket();
 
+  // Enable relay
   mcp.beginPacket(CAN_TX_ENABLE);
-  mcp.write((byte)(vehicle.valorEnable ? 1 : 0));
+  mcp.write((byte)(enable ? 1 : 0));
   mcp.endPacket();
 
+  // Reversa
   mcp.beginPacket(CAN_TX_REVERSA);
-  mcp.write((byte)(vehicle.valorReversa ? 1 : 0));
+  mcp.write((byte)(reversa ? 1 : 0));
   mcp.endPacket();
 
+  // High gear
   mcp.beginPacket(CAN_TX_HIGHGEAR);
-  mcp.write((byte)(vehicle.highGear ? 1 : 0));
+  mcp.write((byte)(hg ? 1 : 0));
   mcp.endPacket();
 }
 
 // ================================================================
-//  OLED
+// OLED
 // ================================================================
 void drawBar(int x, int y, int w, int h, int val, int valMax) {
   display.drawRect(x, y, w, h, SSD1306_WHITE);
@@ -290,9 +339,8 @@ void drawBar(int x, int y, int w, int h, int val, int valMax) {
     display.fillRect(x + 1, y + 1, fill, h - 2, SSD1306_WHITE);
 }
 
-void drawDirBar(int x, int y, int w, int h) {
+void drawDirBar(int x, int y, int w, int h, int cmdDir, int fbDir) {
   const int MID = x + w / 2;
-
   display.drawRect(x, y, w, h, SSD1306_WHITE);
   display.drawLine(MID, y, MID, y + h - 1, SSD1306_WHITE);
 
@@ -303,23 +351,15 @@ void drawDirBar(int x, int y, int w, int h) {
   display.drawPixel(q3, y, SSD1306_WHITE);
   display.drawPixel(q3, y + h - 1, SSD1306_WHITE);
 
-  int cmdX = x + 1 + ((w - 2) * vehicle.valorDir) / 100;
+  int cmdX = x + 1 + ((w - 2) * cmdDir) / 100;
   cmdX = constrain(cmdX, x + 1, x + w - 2);
-  display.fillTriangle(
-    cmdX - 3, y - 5,
-    cmdX + 3, y - 5,
-    cmdX,     y - 1,
-    SSD1306_WHITE
-  );
+  display.fillTriangle(cmdX-3, y-5, cmdX+3, y-5, cmdX, y-1, SSD1306_WHITE);
 
   if (dirFeedbackOnline) {
-    int fbX = x + 1 + ((w - 2) * dirFeedback) / 100;
+    int fbX = x + 1 + ((w - 2) * fbDir) / 100;
     fbX = constrain(fbX, x + 1, x + w - 2);
-    if (fbX >= MID) {
-      display.fillRect(MID, y + 2, fbX - MID, h - 4, SSD1306_WHITE);
-    } else {
-      display.fillRect(fbX, y + 2, MID - fbX, h - 4, SSD1306_WHITE);
-    }
+    if (fbX >= MID) display.fillRect(MID, y+2, fbX-MID, h-4, SSD1306_WHITE);
+    else            display.fillRect(fbX, y+2, MID-fbX, h-4, SSD1306_WHITE);
   } else {
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(x + w/2 - 2, y + 2);
@@ -330,20 +370,33 @@ void drawDirBar(int x, int y, int w, int h) {
 void drawTag(int x, int y, const char *txt, bool active) {
   int w = 6 * strlen(txt) + 2;
   if (active) {
-    display.fillRect(x, y - 1, w, 11, SSD1306_WHITE);
+    display.fillRect(x, y-1, w, 11, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK);
   } else {
-    display.drawRect(x, y - 1, w, 11, SSD1306_WHITE);
+    display.drawRect(x, y-1, w, 11, SSD1306_WHITE);
     display.setTextColor(SSD1306_WHITE);
   }
-  display.setCursor(x + 1, y + 1);
+  display.setCursor(x+1, y+1);
   display.print(txt);
   display.setTextColor(SSD1306_WHITE);
 }
 
 void updateOLED() {
   display.clearDisplay();
-  bool signalLost = vehicle.failsafe || (millis() - vehicle.last_update > 500);
+
+  mutex_enter_blocking(&vehicleMutex);
+  int   cmdDir     = vehicle.valorDir;
+  int   cmdVel     = vehicle.valorVel;
+  int   cmdFreno   = vehicle.valorFreno;
+  int   cmdEnable  = vehicle.valorEnable;
+  int   cmdReversa = vehicle.valorReversa;
+  bool  hg         = vehicle.highGear;
+  bool  bloqueado  = vehicle.motorBloqueado;
+  bool  fs         = vehicle.failsafe;
+  unsigned long upd = vehicle.last_update;
+  mutex_exit(&vehicleMutex);
+
+  bool signalLost = fs || (millis() - upd > 500);
 
   display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK);
@@ -352,107 +405,91 @@ void updateOLED() {
   display.print(F("AMR1"));
 
   display.setCursor(40, 2);
-  if (signalLost)              display.print(F("NO SIGNAL"));
-  else if (!vehicle.valorEnable) display.print(F("  SAFE   "));
-  else                         display.print(F("  LIVE   "));
+  if (signalLost)        display.print(F("NO SIGNAL"));
+  else if (!cmdEnable)   display.print(F(" FRENO   "));
+  else                   display.print(F("  LIVE   "));
 
   display.setCursor(106, 2);
-  if (!canOK)                  display.print(F("CAN-X"));
-  else if (dirFeedbackOnline)  display.print(F("LINK*"));
-  else                         display.print(F("LINK?"));
+  if (!canOK)                 display.print(F("CAN-X"));
+  else if (dirFeedbackOnline) display.print(F("LINK*"));
+  else                        display.print(F("LINK?"));
 
   display.setTextColor(SSD1306_WHITE);
 
   if (signalLost) {
     display.setTextSize(2);
-    display.setCursor(14, 20);
-    display.print(F("TX LOST!"));
+    display.setCursor(14, 20); display.print(F("TX LOST!"));
     display.setTextSize(1);
-    display.setCursor(8, 44);
-    display.print(F("Sistema en HALT"));
-    display.setCursor(8, 54);
-    display.print(F("Espera senal..."));
+    display.setCursor(8, 44);  display.print(F("Sistema en HALT"));
+    display.setCursor(8, 54);  display.print(F("Espera senal..."));
     display.display();
     return;
   }
 
-  // Fila VEL
-  display.setCursor(0, 14);
-  display.print(F("VEL"));
-  drawBar(20, 14, 78, 8, vehicle.valorVel, VEL_MAX_HIGH);
-
+  // VEL
+  display.setCursor(0, 14); display.print(F("VEL"));
+  drawBar(20, 14, 78, 8, cmdVel, VEL_MAX_HIGH);
   display.setCursor(102, 14);
-  int velPct = (vehicle.valorVel * 100) / VEL_MAX_HIGH;
+  int velPct = (cmdVel * 100) / VEL_MAX_HIGH;
   if (velPct < 10) display.print(F("  "));
   else if (velPct < 100) display.print(F(" "));
-  display.print(velPct);
-  display.print('%');
+  display.print(velPct); display.print('%');
 
-  // Fila FRENO proporcional
-  display.setCursor(0, 24);
-  display.print(F("BRK"));
-  drawBar(20, 24, 78, 6, vehicle.valorFreno, 100);
+  // FRENO
+  display.setCursor(0, 24); display.print(F("BRK"));
+  drawBar(20, 24, 78, 6, cmdFreno, 100);
   display.setCursor(102, 24);
-  if (vehicle.valorFreno < 10) display.print(F("  "));
-  else if (vehicle.valorFreno < 100) display.print(F(" "));
-  display.print(vehicle.valorFreno);
-  display.print('%');
+  if (cmdFreno < 10) display.print(F("  "));
+  else if (cmdFreno < 100) display.print(F(" "));
+  display.print(cmdFreno); display.print('%');
 
-  // Fila DIR
-  display.setCursor(0, 34);
-  display.print(F("DIR"));
-  drawDirBar(20, 33, 78, 8);
-
+  // DIR
+  display.setCursor(0, 34); display.print(F("DIR"));
+  drawDirBar(20, 33, 78, 8, cmdDir, dirFeedback);
   display.setCursor(102, 34);
-  if (vehicle.valorDir < 10) display.print(F("  "));
-  else if (vehicle.valorDir < 100) display.print(F(" "));
-  display.print(vehicle.valorDir);
+  if (cmdDir < 10) display.print(F("  "));
+  else if (cmdDir < 100) display.print(F(" "));
+  display.print(cmdDir);
 
-  // Fila FB
+  // FB
   display.setCursor(0, 44);
   if (dirFeedbackOnline) {
-    int err = (int)vehicle.valorDir - (int)dirFeedback;
-    display.print(F("FB:"));
-    display.print(dirFeedback);
-    display.print('%');
-
+    int err = (int)cmdDir - (int)dirFeedback;
+    display.print(F("FB:")); display.print(dirFeedback); display.print('%');
     display.setCursor(48, 44);
     display.print(F("ERR:"));
     if (err > 0) display.print('+');
     display.print(err);
-
     display.setCursor(102, 44);
-    if (abs(err) <= 3) display.print(F("OK "));
+    if (abs(err) <= 3)       display.print(F("OK "));
     else if (abs(err) <= 10) display.print(F("..."));
-    else display.print(F("!!!"));
+    else                     display.print(F("!!!"));
   } else {
-    display.print(F("FB: sin link al actuador"));
+    display.print(F("FB: sin link"));
   }
 
   display.drawLine(0, 52, 127, 52, SSD1306_WHITE);
 
-  drawTag(0, 54, " EN ", vehicle.valorEnable);
+  drawTag(0, 54, " EN ", cmdEnable);
 
   const char *gearTxt;
   bool gearHL;
-  if (vehicle.valorReversa)   { gearTxt = " REV "; gearHL = true; }
-  else if (vehicle.highGear)  { gearTxt = "F-HI "; gearHL = true; }
-  else                        { gearTxt = "F-LO "; gearHL = false; }
+  if (cmdReversa)       { gearTxt = " REV "; gearHL = true;  }
+  else if (hg)          { gearTxt = "F-HI "; gearHL = true;  }
+  else                  { gearTxt = "F-LO "; gearHL = false; }
   drawTag(32, 54, gearTxt, gearHL);
 
-  // 🆕 Tag de freno cambia a "LOCK" si el motor está bloqueado por interlock
-  bool brk = vehicle.valorFreno > 0;
+  bool brk = cmdFreno > 0;
   const char *brkTxt;
-  if (vehicle.motorBloqueado) brkTxt = "LOCK";  // bloqueo activo
-  else if (brk)               brkTxt = "BRK";   // freno aplicado pero motor disponible
-  else                        brkTxt = "---";
+  if (bloqueado) brkTxt = "LOCK";
+  else if (brk)  brkTxt = "BRK";
+  else           brkTxt = "---";
   drawTag(70, 54, brkTxt, brk);
 
   display.setCursor(98, 56);
-  display.setTextColor(SSD1306_WHITE);
   display.print(F("R"));
   if (cntFeedbackRx % 1000 < 100) display.print('0');
-  if (cntFeedbackRx % 1000 < 10) display.print('0');
+  if (cntFeedbackRx % 1000 < 10)  display.print('0');
   display.print(cntFeedbackRx % 1000);
 
   display.display();
@@ -462,46 +499,53 @@ void splashOLED() {
   display.clearDisplay();
   display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
   display.drawRect(3, 3, 122, 58, SSD1306_WHITE);
-
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(20, 12);
-  display.print(F("AMR1 CTRL"));
-
+  display.setCursor(20, 12); display.print(F("AMR1 CTRL"));
   display.setTextSize(1);
-  display.setCursor(16, 34);
-  display.print(F("Dashboard PRO v2.4"));
-  display.setCursor(10, 48);
-  display.print(F("Interlock activo"));
-
+  display.setCursor(16, 34); display.print(F("Dashboard PRO v2.6"));
+  display.setCursor(10, 48); display.print(F("Dir libre en freno"));
   display.display();
 }
 
 // ================================================================
-//  DEBUG SERIAL
+// DEBUG SERIAL
 // ================================================================
 void debugChannels() {
-  Serial.print(F("CH1="));   Serial.print(vehicle.ch[CH_THROTTLE]);
-  Serial.print(F(" CH7="));  Serial.print(vehicle.ch[CH_GEAR_REV]);
-  Serial.print(F(" | DIR_CMD=")); Serial.print(vehicle.valorDir);
-  Serial.print(F(" DIR_FB="));    Serial.print(dirFeedback);
+  mutex_enter_blocking(&vehicleMutex);
+  int  ch0    = vehicle.ch[CH_THROTTLE];
+  int  ch6    = vehicle.ch[CH_GEAR_REV];
+  int  dir    = vehicle.valorDir;
+  int  vel    = vehicle.valorVel;
+  int  freno  = vehicle.valorFreno;
+  int  enable = vehicle.valorEnable;
+  int  rev    = vehicle.valorReversa;
+  bool bloq   = vehicle.motorBloqueado;
+  bool hg     = vehicle.highGear;
+  mutex_exit(&vehicleMutex);
+
+  Serial.print(F("CH1=")); Serial.print(ch0);
+  Serial.print(F(" CH7=")); Serial.print(ch6);
+  Serial.print(F(" | DIR=")); Serial.print(dir);
+  Serial.print(F(" FB=")); Serial.print(dirFeedback);
   Serial.print(dirFeedbackOnline ? F("(ON)") : F("(--)"));
-  Serial.print(F(" | VEL=")); Serial.print(vehicle.valorVel);
-  Serial.print(F(" BRK=")); Serial.print(vehicle.valorFreno); Serial.print('%');
-  if (vehicle.motorBloqueado) Serial.print(F(" [LOCK]"));
+  Serial.print(F(" | VEL=")); Serial.print(vel);
+  Serial.print(F(" BRK=")); Serial.print(freno); Serial.print('%');
+  if (bloq) Serial.print(F(" [LOCK]"));
   Serial.print(F(" | "));
-  if      (vehicle.valorReversa) Serial.print(F("REV "));
-  else if (vehicle.highGear)     Serial.print(F("F-HI"));
-  else                           Serial.print(F("F-LO"));
-  Serial.print(F(" | EN=")); Serial.print(vehicle.valorEnable);
+  if (rev)     Serial.print(F("REV "));
+  else if (hg) Serial.print(F("F-HI"));
+  else         Serial.print(F("F-LO"));
+  Serial.print(F(" | EN=")); Serial.print(enable);
   Serial.print(F(" | RX=")); Serial.println(cntFeedbackRx);
 }
 
 // ================================================================
-//  SETUP & LOOP
+// SETUP & LOOP (Core 0)
 // ================================================================
 void setup() {
   Serial.begin(115200);
+  mutex_init(&vehicleMutex);
 
   Wire.begin();
   if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
@@ -518,9 +562,7 @@ void setup() {
   digitalWrite(PIN_CAN_RESET, HIGH);
   delay(10);
 
-  if (mcp.begin(CAN_BAUDRATE)) {
-    canOK = true;
-  }
+  if (mcp.begin(CAN_BAUDRATE)) canOK = true;
 }
 
 void loop() {
